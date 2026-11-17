@@ -28,6 +28,16 @@ import '../widgets/custom_scale_widget.dart';
 
 final initText = '1' * 1024;
 
+// The visible compose bar keeps one invisible character in its field. When
+// the user presses Backspace on an otherwise empty field, the IME deletes this
+// character, which is how the bar knows to send Backspace to the remote side.
+final _kComposeSentinel = String.fromCharCode(0x200B); // zero-width space
+
+// Mobile soft keyboards compose text locally in a visible bar and send whole
+// strings. Diffing a hidden field breaks with composing IMEs (Korean, Japanese,
+// Chinese) and word-level autocorrect, which leak the hidden filler text.
+bool get _useComposeBar => isIOS || isAndroid;
+
 // Workaround for Android (default input method, Microsoft SwiftKey keyboard) when using physical keyboard.
 // When connecting a physical keyboard, `KeyEvent.physicalKey.usbHidUsage` are wrong is using Microsoft SwiftKey keyboard.
 // https://github.com/flutter/flutter/issues/159384
@@ -112,6 +122,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   final TextEditingController _textController =
       TextEditingController(text: initText);
+  final TextEditingController _composeController =
+      TextEditingController(text: _kComposeSentinel);
 
   _RemotePageState(String id) {
     initSharedStates(id);
@@ -205,6 +217,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     await gFFI.invokeMethod("enable_soft_keyboard", true);
     _mobileFocusNode.dispose();
     _physicalFocusNode.dispose();
+    _composeController.dispose();
     clearWaylandKeyboardPromptSuppressedForConnection(sessionId.toString());
     _waylandKeyboardGateWorker?.dispose();
     inputModel.keyboardInputAllowed = true;
@@ -467,6 +480,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // destroy first, so that our _value trick can work
     _value = initText;
     _textController.text = _value;
+    _resetCompose();
     setState(() => _showEdit = false);
     _timer?.cancel();
     _timer = Timer(kMobileDelaySoftKeyboard, () {
@@ -482,6 +496,96 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     });
   }
 
+  void _resetCompose([String text = '']) {
+    final value = _kComposeSentinel + text;
+    _composeController.value = TextEditingValue(
+        text: value, selection: TextSelection.collapsed(offset: value.length));
+  }
+
+  String get _composeText =>
+      _composeController.text.replaceAll(_kComposeSentinel, '');
+
+  void _handleComposeChanged(String value) {
+    if (value.startsWith(_kComposeSentinel)) return;
+    // The sentinel was deleted: Backspace on an empty field edits the remote side.
+    if (inputModel.keyboardInputAllowed) {
+      inputModel.inputKey('VK_BACK');
+    }
+    _resetCompose(value.replaceAll(_kComposeSentinel, ''));
+  }
+
+  Future<void> _submitCompose({required bool pressEnter}) async {
+    if (!inputModel.keyboardInputAllowed) return;
+    final text = _composeText;
+    _resetCompose();
+    if (text.isNotEmpty) {
+      await bind.sessionInputString(sessionId: sessionId, value: text);
+    }
+    if (pressEnter) {
+      inputModel.inputKey('VK_RETURN');
+    }
+    _mobileFocusNode.requestFocus();
+  }
+
+  void _closeSoftKeyboard() {
+    setState(() {
+      _showEdit = false;
+      gFFI.invokeMethod("enable_soft_keyboard", false);
+      _mobileFocusNode.unfocus();
+      _physicalFocusNode.requestFocus();
+    });
+  }
+
+  // Visible input line above the soft keyboard: text and Hangul composition
+  // stay local until sent. The send button types the text; the keyboard's
+  // return key types the text and then Enter (Enter alone when empty).
+  Widget _buildComposeBar() {
+    final theme = Theme.of(context);
+    return Material(
+      elevation: 8,
+      color: theme.colorScheme.surface,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+        child: Row(
+          children: [
+            IconButton(
+              icon: const Icon(Icons.keyboard_hide),
+              tooltip: translate('Close'),
+              onPressed: _closeSoftKeyboard,
+            ),
+            Expanded(
+              child: TextField(
+                controller: _composeController,
+                focusNode: _mobileFocusNode,
+                autofocus: true,
+                autocorrect: false,
+                textCapitalization: TextCapitalization.none,
+                keyboardType: TextInputType.text,
+                textInputAction: TextInputAction.send,
+                maxLines: 1,
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: UnderlineInputBorder(),
+                  contentPadding:
+                      EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                ),
+                onChanged: _handleComposeChanged,
+                onSubmitted: (_) => _submitCompose(pressEnter: true),
+                // Keep the keyboard open after the return key.
+                onEditingComplete: () {},
+              ),
+            ),
+            IconButton(
+              icon: Icon(Icons.send, color: MyTheme.accent),
+              tooltip: translate('Send'),
+              onPressed: () => _submitCompose(pressEnter: false),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _bottomWidget() => _showGestureHelp
       ? getGestureHelp()
       : (_showBar && gFFI.ffiModel.pi.displays.isNotEmpty
@@ -492,7 +596,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final keyboardIsVisible =
         keyboardVisibilityController.isVisible && _showEdit;
-    final showActionButton = !_showBar || keyboardIsVisible || _showGestureHelp;
+    // The compose bar has its own close button; the floating button would
+    // cover its send button.
+    final composeBarVisible = _useComposeBar && _showEdit;
+    final showActionButton = !composeBarVisible &&
+        (!_showBar || keyboardIsVisible || _showGestureHelp);
 
     return WillPopScope(
       onWillPop: () async {
@@ -725,6 +833,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       (_showEdit || chatKeyboardRequested),
                   showGestureHelp: _showGestureHelp);
             }),
+            if (_useComposeBar)
+              _showEdit
+                  ? Positioned(
+                      left: 0, right: 0, bottom: 0, child: _buildComposeBar())
+                  : Offstage()
+            else
             SizedBox(
               width: 0,
               height: 0,

@@ -1422,6 +1422,21 @@ class InputModel {
             .encode(modify({'id': id, 'type': 'wheel', 'y': y.toString()})));
   }
 
+  /// Send a scroll event with horizontal [x] and vertical [y] wheel steps.
+  /// Positive [y] scrolls up and positive [x] scrolls left, as in [scroll].
+  Future<void> scrollXY(int x, int y) async {
+    if (isViewCamera) return;
+    if (x == 0 && y == 0) return;
+    await bind.sessionSendMouse(
+        sessionId: sessionId,
+        msg: json.encode(modify({
+          'id': id,
+          'type': 'wheel',
+          'x': x.toString(),
+          'y': y.toString(),
+        })));
+  }
+
   /// Reset key modifiers to false, including [shift], [ctrl], [alt] and [command].
   void resetModifiers() {
     shift = ctrl = alt = command = false;

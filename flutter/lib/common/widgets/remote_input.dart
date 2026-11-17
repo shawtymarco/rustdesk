@@ -76,8 +76,21 @@ class RawTouchGestureDetectorRegion extends StatefulWidget {
       _RawTouchGestureDetectorRegionState();
 }
 
+/// How a mobile touch-mode two-finger gesture is interpreted. The first
+/// clear movement decides: fingers moving together scroll the remote side,
+/// fingers spreading or pinching zoom the local canvas.
+enum _TwoFingerMode { undecided, scroll, zoom }
+
+// Logical pixels of two-finger travel per remote wheel step.
+const double _kTouchScrollStepPx = 20;
+// Focal-point travel that commits a two-finger gesture to scrolling.
+const double _kTouchScrollSlopPx = 10;
+// Scale change that commits a two-finger gesture to zooming.
+const double _kTouchZoomSlop = 0.12;
+
 /// touchMode only:
 ///   LongPress -> right click
+///   TwoFingerPan -> scroll (mobile), TwoFingerPinch -> zoom canvas (mobile)
 ///   OneFingerPan -> start/end -> left down start/end
 ///   onDoubleTapDown -> move to
 ///   onLongPressDown => move to
@@ -92,6 +105,11 @@ class _RawTouchGestureDetectorRegionState
   int _cacheLongPressPositionTs = 0;
   double _mouseScrollIntegral = 0; // mouse scroll speed controller
   double _scale = 1;
+
+  // Mobile touch mode two-finger gesture state.
+  _TwoFingerMode _twoFingerMode = _TwoFingerMode.undecided;
+  Offset _twoFingerStartFocal = Offset.zero;
+  Offset _twoFingerScrollRemainder = Offset.zero;
 
   // Workaround tap down event when two fingers are used to scale(mobile)
   TapDownDetails? _lastTapDownDetails;
@@ -456,6 +474,51 @@ class _RawTouchGestureDetectorRegionState
       // Initialize the last focal point to calculate deltas manually.
       _lastSpecialHoldDragFocalPoint = d.focalPoint;
     }
+    _twoFingerMode = _TwoFingerMode.undecided;
+    _twoFingerStartFocal = d.localFocalPoint;
+    _twoFingerScrollRemainder = Offset.zero;
+  }
+
+  bool get _isMobileTouchMode => isMobile && ffiModel.touchMode;
+
+  void _zoomAndPanCanvas(ScaleUpdateDetails d) {
+    ffi.canvasModel.updateScale(d.scale / _scale, d.focalPoint);
+    _scale = d.scale;
+    ffi.canvasModel.panX(d.focalPointDelta.dx);
+    ffi.canvasModel.panY(d.focalPointDelta.dy);
+  }
+
+  // Mobile touch mode: two fingers moving together scroll the remote content
+  // under them (natural direction), a pinch zooms the canvas.
+  Future<void> _touchModeTwoFingerUpdate(ScaleUpdateDetails d) async {
+    if (_twoFingerMode == _TwoFingerMode.undecided) {
+      if (!canvasLocked && (d.scale - 1).abs() > _kTouchZoomSlop) {
+        _twoFingerMode = _TwoFingerMode.zoom;
+        // Start zooming from here so the decision slop does not jump the canvas.
+        _scale = d.scale;
+      } else if ((d.localFocalPoint - _twoFingerStartFocal).distance >
+          _kTouchScrollSlopPx) {
+        _twoFingerMode = _TwoFingerMode.scroll;
+        // Wheel events go to the element under the remote cursor.
+        await ffi.cursorModel
+            .move(_twoFingerStartFocal.dx, _twoFingerStartFocal.dy);
+      } else {
+        return;
+      }
+    }
+
+    if (_twoFingerMode == _TwoFingerMode.zoom) {
+      _zoomAndPanCanvas(d);
+      return;
+    }
+
+    final travel = _twoFingerScrollRemainder + d.focalPointDelta;
+    final stepsX = (travel.dx / _kTouchScrollStepPx).truncate();
+    final stepsY = (travel.dy / _kTouchScrollStepPx).truncate();
+    _twoFingerScrollRemainder = Offset(travel.dx - stepsX * _kTouchScrollStepPx,
+        travel.dy - stepsY * _kTouchScrollStepPx);
+    // Finger moving down/right shows content above/left: positive wheel steps.
+    await inputModel.scrollXY(stepsX, stepsY);
   }
 
   onTwoFingerScaleUpdate(ScaleUpdateDetails d) async {
@@ -469,6 +532,13 @@ class _RawTouchGestureDetectorRegionState
       final delta = d.focalPoint - _lastSpecialHoldDragFocalPoint;
       _lastSpecialHoldDragFocalPoint = d.focalPoint;
       await ffi.cursorModel.updatePan(delta * 2.0, d.focalPoint, handleTouch);
+      return;
+    }
+
+    // Scrolling must keep working when the canvas is locked, so decide before
+    // the lock check; zooming itself still honours the lock.
+    if (_isMobileTouchMode) {
+      await _touchModeTwoFingerUpdate(d);
       return;
     }
 
@@ -488,10 +558,7 @@ class _RawTouchGestureDetectorRegionState
       }
     } else {
       // mobile
-      ffi.canvasModel.updateScale(d.scale / _scale, d.focalPoint);
-      _scale = d.scale;
-      ffi.canvasModel.panX(d.focalPointDelta.dx);
-      ffi.canvasModel.panY(d.focalPointDelta.dy);
+      _zoomAndPanCanvas(d);
     }
   }
 
@@ -531,6 +598,12 @@ class _RawTouchGestureDetectorRegionState
         };
 
   makeGestures(BuildContext context) {
+    // A double-tap recognizer holds every single tap in the gesture arena
+    // until the double-tap timeout (300 ms) passes, so each click reaches the
+    // remote side late. In mobile touch mode each tap already clicks at the
+    // tapped point, and two quick clicks are a double-click for the remote OS,
+    // so the recognizer only adds latency there.
+    final useDoubleTapRecognizer = !_isMobileTouchMode;
     return <Type, GestureRecognizerFactory>{
       // Official
       TapGestureRecognizer:
@@ -541,13 +614,14 @@ class _RawTouchGestureDetectorRegionState
           ..onTapUp = onTapUp
           ..onTap = onTap;
       }),
-      DoubleTapGestureRecognizer:
-          GestureRecognizerFactoryWithHandlers<DoubleTapGestureRecognizer>(
-              () => DoubleTapGestureRecognizer(), (instance) {
-        instance
-          ..onDoubleTapDown = onDoubleTapDown
-          ..onDoubleTap = onDoubleTap;
-      }),
+      if (useDoubleTapRecognizer)
+        DoubleTapGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<DoubleTapGestureRecognizer>(
+                () => DoubleTapGestureRecognizer(), (instance) {
+          instance
+            ..onDoubleTapDown = onDoubleTapDown
+            ..onDoubleTap = onDoubleTap;
+        }),
       LongPressGestureRecognizer:
           GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
               () => LongPressGestureRecognizer(), (instance) {
@@ -558,21 +632,26 @@ class _RawTouchGestureDetectorRegionState
           ..onLongPressMoveUpdate = onLongPressMoveUpdate;
       }),
       // Customized
-      HoldTapMoveGestureRecognizer:
-          GestureRecognizerFactoryWithHandlers<HoldTapMoveGestureRecognizer>(
-              () => HoldTapMoveGestureRecognizer(),
-              (instance) => instance
-                ..onHoldDragStart = onHoldDragStart
-                ..onHoldDragUpdate = onHoldDragUpdate
-                ..onHoldDragCancel = onHoldDragCancel
-                ..onHoldDragEnd = onHoldDragEnd),
-      DoubleFinerTapGestureRecognizer:
-          GestureRecognizerFactoryWithHandlers<DoubleFinerTapGestureRecognizer>(
-              () => DoubleFinerTapGestureRecognizer(), (instance) {
-        instance
-          ..onDoubleFinerTap = onDoubleFinerTap
-          ..onDoubleFinerTapDown = onDoubleFinerTapDown;
-      }),
+      // Both recognizers below also hold the arena for the double-tap timeout.
+      // Their handlers do nothing in mobile touch mode (hold-drag and
+      // two-finger right click are mouse-mode gestures), so skip them there.
+      if (useDoubleTapRecognizer)
+        HoldTapMoveGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<HoldTapMoveGestureRecognizer>(
+                () => HoldTapMoveGestureRecognizer(),
+                (instance) => instance
+                  ..onHoldDragStart = onHoldDragStart
+                  ..onHoldDragUpdate = onHoldDragUpdate
+                  ..onHoldDragCancel = onHoldDragCancel
+                  ..onHoldDragEnd = onHoldDragEnd),
+      if (useDoubleTapRecognizer)
+        DoubleFinerTapGestureRecognizer: GestureRecognizerFactoryWithHandlers<
+                DoubleFinerTapGestureRecognizer>(
+            () => DoubleFinerTapGestureRecognizer(), (instance) {
+          instance
+            ..onDoubleFinerTap = onDoubleFinerTap
+            ..onDoubleFinerTapDown = onDoubleFinerTapDown;
+        }),
       CustomTouchGestureRecognizer:
           GestureRecognizerFactoryWithHandlers<CustomTouchGestureRecognizer>(
               () => CustomTouchGestureRecognizer(), (instance) {
