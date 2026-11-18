@@ -31,6 +31,8 @@ final initText = '1' * 1024;
 // The visible compose bar keeps one invisible character in its field. When
 // the user presses Backspace on an otherwise empty field, the IME deletes this
 // character, which is how the bar knows to send Backspace to the remote side.
+// iOS native video texture (AppDelegate.swift).
+const _kVideoTextureChannel = MethodChannel('rustdesk/video_texture');
 final _kComposeSentinel = String.fromCharCode(0x200B); // zero-width space
 
 // Mobile soft keyboards compose text locally in a visible bar and send whole
@@ -122,7 +124,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   final TextEditingController _textController =
       TextEditingController(text: initText);
-  // Android: Flutter texture the Rust side draws video frames into.
+  // Android/iOS: Flutter texture the Rust side draws video frames into.
   int? _renderTextureId;
 
   final TextEditingController _composeController =
@@ -137,9 +139,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    if (isAndroid) {
-      gFFI
-          .invokeMethodWithResult<int>('create_render_texture')
+    if (isAndroid || isIOS) {
+      (isAndroid
+              ? gFFI.invokeMethodWithResult<int>('create_render_texture')
+              : _kVideoTextureChannel.invokeMethod<int>('create'))
           .then((id) {
         if (mounted && id != null && id >= 0) {
           setState(() => _renderTextureId = id);
@@ -220,7 +223,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // "Connecting...". Dispatching it here makes teardown happen synchronously on
     // pop; the `sessionClose` in `gFFI.close()` becomes a no-op once removed.
     if (_renderTextureId != null) {
-      unawaited(gFFI.invokeMethod('release_render_texture'));
+      unawaited(isAndroid
+          ? gFFI.invokeMethod('release_render_texture')
+          : _kVideoTextureChannel.invokeMethod('release'));
     }
     unawaited(bind.sessionClose(sessionId: sessionId));
     // https://github.com/flutter/flutter/issues/64935

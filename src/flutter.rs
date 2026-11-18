@@ -876,10 +876,15 @@ impl InvokeUiSession for FlutterHandler {
         }
     }
 
+    // iOS: hand frames to the Runner's Flutter texture (AppDelegate.swift);
+    // Dart only decodes the first frame of each size, as on Android.
     #[inline]
     #[cfg(target_os = "ios")]
     fn on_rgba(&self, display: usize, rgba: &mut scrap::ImageRgb) {
-        self.on_rgba_soft_render(display, rgba);
+        match ios_render::draw(rgba) {
+            Some(false) => {}
+            Some(true) | None => self.on_rgba_soft_render(display, rgba),
+        }
     }
 
     // Android: draw straight into the Flutter texture surface. Dart still gets
@@ -2563,5 +2568,52 @@ pub mod android_render {
         let need_soft = !window.soft_frame_sent;
         window.soft_frame_sent = true;
         Some(need_soft)
+    }
+}
+
+/// Native video output for the iOS client; see `RustDeskVideoTexture` in
+/// flutter/ios/Runner/AppDelegate.swift.
+#[cfg(target_os = "ios")]
+pub mod ios_render {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    // 0: not drawn, 1: drawn, 2: drawn and first frame of the texture.
+    type OnRgba = unsafe extern "C" fn(*const u8, usize, i32, i32) -> i32;
+
+    // Set by the Runner at start-up. A callback instead of a linked symbol,
+    // because the crate is also built as a cdylib without the Runner.
+    static CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+    #[no_mangle]
+    pub extern "C" fn rustdesk_ios_set_video_callback(callback: Option<OnRgba>) {
+        CALLBACK.store(callback.map_or(0, |f| f as usize), Ordering::SeqCst);
+    }
+
+    static LAST_SIZE: Mutex<(usize, usize)> = Mutex::new((0, 0));
+
+    /// `None`: not drawn, use the soft path. `Some(true)`: drawn, and Dart
+    /// also needs this frame (first of its size or of the texture).
+    pub fn draw(rgba: &scrap::ImageRgb) -> Option<bool> {
+        if rgba.w == 0 || rgba.h == 0 {
+            return None;
+        }
+        let callback = CALLBACK.load(Ordering::SeqCst);
+        if callback == 0 {
+            return None;
+        }
+        let res = unsafe {
+            let f: OnRgba = std::mem::transmute(callback);
+            f(rgba.raw.as_ptr(), rgba.raw.len(), rgba.w as _, rgba.h as _)
+        };
+        if res == 0 {
+            return None;
+        }
+        let mut last = LAST_SIZE.lock().unwrap();
+        let changed = *last != (rgba.w, rgba.h);
+        *last = (rgba.w, rgba.h);
+        Some(res == 2 || changed)
     }
 }
