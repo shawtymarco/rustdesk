@@ -125,9 +125,25 @@ Future<void> initEnv(String appType) async {
   // focus on multi-ffi on desktop first
   await initGlobalFFI();
   // await Firebase.initializeApp();
+  if (isMobile) _applyLowLatencyDefaults();
   _registerEventHandler();
   // Update the system theme.
   updateSystemWindowTheme();
+}
+
+// Mobile fork: once, default new sessions to 60 fps (custom quality 50)
+// instead of the stock 30 fps, which halves the frame wait. Any choice the
+// user already made in Settings is kept, and Settings can still change it.
+void _applyLowLatencyDefaults() {
+  const doneKey = 'fork-low-latency-defaults';
+  if (bind.mainGetLocalOption(key: doneKey) == 'Y') return;
+  if (bind.mainGetUserDefaultOption(key: kOptionImageQuality) == 'balanced' &&
+      bind.mainGetUserDefaultOption(key: 'custom-fps') == '30') {
+    bind.mainSetUserDefaultOption(key: kOptionImageQuality, value: 'custom');
+    bind.mainSetUserDefaultOption(key: 'custom_image_quality', value: '50');
+    bind.mainSetUserDefaultOption(key: 'custom-fps', value: '60');
+  }
+  bind.mainSetLocalOption(key: doneKey, value: 'Y');
 }
 
 void runMainApp(bool startService) async {

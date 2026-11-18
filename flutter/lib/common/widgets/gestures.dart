@@ -99,7 +99,11 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
           if (onOneFingerPanEnd != null) {
             onOneFingerPanEnd!(_getDragEndDetails(d));
           }
-          break;
+          // The debounce below only guards multi-finger lifts. Keeping the
+          // one-finger state for 200 ms made a quick second drag skip its
+          // pan start (no mouse down) or wait 200 ms before starting.
+          _currentState = GestureState.none;
+          return;
         case GestureState.twoFingerScale:
           debugPrint("TwoFingerState.scale onEnd");
           if (onTwoFingerScaleEnd != null) {
