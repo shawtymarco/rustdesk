@@ -114,6 +114,8 @@ class _RawTouchGestureDetectorRegionState
   // `onDoubleTap()` does not provide the position of the tap event.
   Offset _lastPosOfDoubleTapDown = Offset.zero;
   bool _touchModePanStarted = false;
+  // Mobile touch mode: one-finger drag that started outside the desktop.
+  bool _emptyAreaPanning = false;
   Offset _doubleFinerTapPosition = Offset.zero;
 
   // For mouse mode, we need to block the events when the cursor is in a blocked area.
@@ -380,6 +382,9 @@ class _RawTouchGestureDetectorRegionState
         return;
       }
       if (!ffi.cursorModel.isInRemoteRect(d.localPosition)) {
+        // Mobile: dragging the empty area around the desktop moves the view,
+        // as in Chrome Remote Desktop.
+        if (isMobile && !canvasLocked) _emptyAreaPanning = true;
         return;
       }
 
@@ -420,6 +425,11 @@ class _RawTouchGestureDetectorRegionState
     if (isNotTouchBasedDevice()) {
       return;
     }
+    if (_emptyAreaPanning) {
+      ffi.canvasModel.panX(d.delta.dx);
+      ffi.canvasModel.panY(d.delta.dy);
+      return;
+    }
     if (ffi.cursorModel.shouldBlock(d.localPosition.dx, d.localPosition.dy)) {
       return;
     }
@@ -436,6 +446,10 @@ class _RawTouchGestureDetectorRegionState
 
   onOneFingerPanEnd(DragEndDetails d) async {
     _touchModePanStarted = false;
+    if (_emptyAreaPanning) {
+      _emptyAreaPanning = false;
+      return;
+    }
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -456,6 +470,7 @@ class _RawTouchGestureDetectorRegionState
   // double-click problem on iPad with magic mouse.
   onOneFingerPanCancel() {
     _touchModePanStarted = false;
+    _emptyAreaPanning = false;
   }
 
   // scale + pan event
