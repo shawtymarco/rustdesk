@@ -877,9 +877,21 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     #[inline]
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
     fn on_rgba(&self, display: usize, rgba: &mut scrap::ImageRgb) {
         self.on_rgba_soft_render(display, rgba);
+    }
+
+    // Android: draw straight into the Flutter texture surface. Dart still gets
+    // one decoded frame per frame size for its layout and cursor maths; the
+    // per-frame Dart decode, the slowest step of the soft path, is skipped.
+    #[inline]
+    #[cfg(target_os = "android")]
+    fn on_rgba(&self, display: usize, rgba: &mut scrap::ImageRgb) {
+        match android_render::draw(rgba) {
+            Some(false) => {}
+            Some(true) | None => self.on_rgba_soft_render(display, rgba),
+        }
     }
 
     #[inline]
@@ -2426,5 +2438,130 @@ pub(super) mod async_tasks {
             super::APP_TYPE_MAIN,
             serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
         );
+    }
+}
+
+/// Native video output for the Android client: frames are copied into the
+/// `Surface` of a Flutter `SurfaceTexture` through `ANativeWindow`, so the Dart
+/// side shows them with a `Texture` widget instead of decoding every frame.
+#[cfg(target_os = "android")]
+pub mod android_render {
+    use std::{ffi::c_void, ptr, sync::Mutex};
+
+    #[repr(C)]
+    struct ANativeWindowBuffer {
+        width: i32,
+        height: i32,
+        stride: i32,
+        format: i32,
+        bits: *mut c_void,
+        reserved: [u32; 6],
+    }
+
+    #[link(name = "android")]
+    extern "C" {
+        fn ANativeWindow_fromSurface(env: *mut c_void, surface: *mut c_void) -> *mut c_void;
+        fn ANativeWindow_release(window: *mut c_void);
+        fn ANativeWindow_setBuffersGeometry(
+            window: *mut c_void,
+            width: i32,
+            height: i32,
+            format: i32,
+        ) -> i32;
+        fn ANativeWindow_lock(
+            window: *mut c_void,
+            out_buffer: *mut ANativeWindowBuffer,
+            in_out_dirty_bounds: *mut c_void,
+        ) -> i32;
+        fn ANativeWindow_unlockAndPost(window: *mut c_void) -> i32;
+    }
+
+    // Byte order R, G, B, A: the client decodes to `ImageFormat::ABGR` on Android.
+    const WINDOW_FORMAT_RGBA_8888: i32 = 1;
+
+    struct Window {
+        ptr: *mut c_void,
+        width: usize,
+        height: usize,
+        // Whether Dart has been sent a soft frame of the current size.
+        soft_frame_sent: bool,
+    }
+
+    // The window pointer is only used under the mutex.
+    unsafe impl Send for Window {}
+
+    static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+
+    /// Replace the output surface; a null `surface` stops native output.
+    pub unsafe fn set_surface(env: *mut c_void, surface: *mut c_void) {
+        let mut window = WINDOW.lock().unwrap();
+        if let Some(old) = window.take() {
+            ANativeWindow_release(old.ptr);
+        }
+        if surface.is_null() {
+            return;
+        }
+        let ptr = ANativeWindow_fromSurface(env, surface);
+        if !ptr.is_null() {
+            *window = Some(Window {
+                ptr,
+                width: 0,
+                height: 0,
+                soft_frame_sent: false,
+            });
+        }
+    }
+
+    /// Draw one frame. `None`: no surface or the draw failed, use the soft path.
+    /// `Some(true)`: drawn, and Dart also needs this frame (first of its size).
+    pub fn draw(rgba: &scrap::ImageRgb) -> Option<bool> {
+        let mut guard = WINDOW.lock().unwrap();
+        let window = guard.as_mut()?;
+        let (w, h) = (rgba.w, rgba.h);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let src_stride = rgba.raw.len() / h;
+        if src_stride < w * 4 {
+            return None;
+        }
+        unsafe {
+            if window.width != w || window.height != h {
+                if ANativeWindow_setBuffersGeometry(
+                    window.ptr,
+                    w as _,
+                    h as _,
+                    WINDOW_FORMAT_RGBA_8888,
+                ) != 0
+                {
+                    return None;
+                }
+                window.width = w;
+                window.height = h;
+                window.soft_frame_sent = false;
+            }
+            let mut buffer: ANativeWindowBuffer = std::mem::zeroed();
+            if ANativeWindow_lock(window.ptr, &mut buffer, ptr::null_mut()) != 0 {
+                return None;
+            }
+            let dst = buffer.bits as *mut u8;
+            let dst_stride = buffer.stride.max(0) as usize * 4;
+            let rows = h.min(buffer.height.max(0) as usize);
+            let row_bytes = (w.min(buffer.width.max(0) as usize)) * 4;
+            let src = rgba.raw.as_ptr();
+            if !dst.is_null() {
+                for y in 0..rows {
+                    ptr::copy_nonoverlapping(
+                        src.add(y * src_stride),
+                        dst.add(y * dst_stride),
+                        row_bytes,
+                    );
+                }
+            }
+            ANativeWindow_unlockAndPost(window.ptr);
+        }
+        let need_soft = !window.soft_frame_sent;
+        window.soft_frame_sent = true;
+        Some(need_soft)
     }
 }

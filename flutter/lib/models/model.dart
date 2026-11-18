@@ -2019,7 +2019,7 @@ class ImageModel with ChangeNotifier {
       rgba,
       rect?.width.toInt() ?? 0,
       rect?.height.toInt() ?? 0,
-      isWeb | isWindows | isLinux
+      isWeb | isWindows | isLinux | isAndroid
           ? ui.PixelFormat.rgba8888
           : ui.PixelFormat.bgra8888,
     );

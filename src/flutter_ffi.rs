@@ -3136,6 +3136,19 @@ pub mod server_side {
         return env.new_string(res).unwrap_or(input).into_raw();
     }
 
+    /// Output surface for native video rendering in the controlling client.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_setRenderSurface(
+        env: JNIEnv,
+        _class: JClass,
+        surface: JObject,
+    ) {
+        crate::flutter::android_render::set_surface(
+            env.get_raw() as *mut std::ffi::c_void,
+            surface.as_raw() as *mut std::ffi::c_void,
+        );
+    }
+
     #[no_mangle]
     pub unsafe extern "system" fn Java_ffi_FFI_refreshScreen(_env: JNIEnv, _class: JClass) {
         crate::server::video_service::refresh()

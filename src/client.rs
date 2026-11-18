@@ -2667,7 +2667,9 @@ impl VideoHandler {
         let luid = Self::get_adapter_luid();
         log::info!("new video handler for display #{_display}, format: {format:?}, luid: {luid:?}");
         let rgba_format =
-            if cfg!(feature = "flutter") && (cfg!(windows) || cfg!(target_os = "linux")) {
+            if cfg!(feature = "flutter")
+                && (cfg!(windows) || cfg!(target_os = "linux") || cfg!(target_os = "android"))
+            {
                 ImageFormat::ABGR
             } else {
                 ImageFormat::ARGB

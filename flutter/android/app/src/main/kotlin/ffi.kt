@@ -21,6 +21,7 @@ object FFI {
     external fun onAudioFrameUpdate(buf: ByteBuffer)
     external fun translateLocale(localeName: String, input: String): String
     external fun refreshScreen()
+    external fun setRenderSurface(surface: android.view.Surface?)
     external fun closeAllSessions()
     external fun setFrameRawEnable(name: String, value: Boolean)
     external fun setCodecInfo(info: String)

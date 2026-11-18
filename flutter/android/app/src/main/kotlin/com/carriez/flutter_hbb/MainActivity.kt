@@ -39,6 +39,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.android.FlutterView
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.view.TextureRegistry
+import android.view.Surface
 import kotlin.concurrent.thread
 import java.io.File
 import java.io.FileInputStream
@@ -78,6 +80,29 @@ class MainActivity : FlutterActivity() {
 
     private var isAudioStart = false
     private val audioRecordHandle = AudioRecordHandle(this, { false }, { isAudioStart })
+
+    // Native video output of the controlling client (see android_render in flutter.rs).
+    private var renderTexture: TextureRegistry.SurfaceTextureEntry? = null
+    private var renderSurface: Surface? = null
+
+    private fun createRenderTexture(): Long {
+        releaseRenderTexture()
+        val engine = flutterEngine ?: return -1
+        val entry = engine.renderer.createSurfaceTexture()
+        val surface = Surface(entry.surfaceTexture())
+        renderTexture = entry
+        renderSurface = surface
+        FFI.setRenderSurface(surface)
+        return entry.id()
+    }
+
+    private fun releaseRenderTexture() {
+        FFI.setRenderSurface(null)
+        renderSurface?.release()
+        renderSurface = null
+        renderTexture?.release()
+        renderTexture = null
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -255,6 +280,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         documentPicker.close()
+        releaseRenderTexture()
         Log.e(logTag, "onDestroy")
         // The process can outlive the UI whenever something keeps it alive:
         // MainService, or the accessibility InputService on its own. Only the
@@ -377,6 +403,13 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.success(true)
                     }
+                }
+                "create_render_texture" -> {
+                    result.success(createRenderTexture())
+                }
+                "release_render_texture" -> {
+                    releaseRenderTexture()
+                    result.success(true)
                 }
                 "enable_soft_keyboard" -> {
                     // https://blog.csdn.net/hanye2020/article/details/105553780

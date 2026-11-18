@@ -122,6 +122,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   final TextEditingController _textController =
       TextEditingController(text: initText);
+  // Android: Flutter texture the Rust side draws video frames into.
+  int? _renderTextureId;
+
   final TextEditingController _composeController =
       TextEditingController(text: _kComposeSentinel);
 
@@ -134,6 +137,15 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    if (isAndroid) {
+      gFFI
+          .invokeMethodWithResult<int>('create_render_texture')
+          .then((id) {
+        if (mounted && id != null && id >= 0) {
+          setState(() => _renderTextureId = id);
+        }
+      });
+    }
     gFFI.ffiModel.updateEventListener(sessionId, widget.id);
     gFFI.start(
       widget.id,
@@ -207,6 +219,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // down. The reconnect then re-attaches to the leaked session and is stuck on
     // "Connecting...". Dispatching it here makes teardown happen synchronously on
     // pop; the `sessionClose` in `gFFI.close()` becomes a no-op once removed.
+    if (_renderTextureId != null) {
+      unawaited(gFFI.invokeMethod('release_render_texture'));
+    }
     unawaited(bind.sessionClose(sessionId: sessionId));
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
@@ -842,6 +857,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         child: Stack(children: () {
           final paints = [
             ImagePaint(ffiModel: gFFI.ffiModel),
+            if (_renderTextureId != null)
+              VideoTexturePaint(
+                  ffiModel: gFFI.ffiModel, textureId: _renderTextureId!),
             Positioned(
               top: 10,
               right: 10,
@@ -1360,6 +1378,48 @@ class ImagePaint extends StatelessWidget {
     return CustomPaint(
       painter: ImagePainter(
           image: m.image, x: c.x / s, y: (c.y + adjust) / s, scale: s),
+    );
+  }
+}
+
+// Native video frames (Android), laid out exactly where ImagePaint draws the
+// last decoded image, which stays underneath for layout and as a fallback.
+class VideoTexturePaint extends StatelessWidget {
+  final FfiModel ffiModel;
+  final int textureId;
+  VideoTexturePaint({Key? key, required this.ffiModel, required this.textureId})
+      : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final m = Provider.of<ImageModel>(context);
+    final c = Provider.of<CanvasModel>(context);
+    final image = m.image;
+    if (image == null) return const SizedBox.shrink();
+    var s = c.scale;
+    if (ffiModel.isPeerLinux) {
+      final displays = ffiModel.pi.getCurDisplays();
+      if (displays.isNotEmpty) {
+        s = s / displays[0].scale;
+      }
+    }
+    final adjust = c.getAdjustY();
+    // Same rounding as ImagePainter, which draws at whole image pixels.
+    final left = (c.x / s).truncateToDouble() * s;
+    final top = ((c.y + adjust) / s).truncateToDouble() * s;
+    return Positioned(
+      left: left,
+      top: top,
+      width: image.width * s,
+      height: image.height * s,
+      child: IgnorePointer(
+        child: Texture(
+          textureId: textureId,
+          filterQuality: (s - 1.0).abs() > 0.001
+              ? FilterQuality.medium
+              : FilterQuality.none,
+        ),
+      ),
     );
   }
 }
