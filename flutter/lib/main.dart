@@ -125,10 +125,7 @@ Future<void> initEnv(String appType) async {
   // focus on multi-ffi on desktop first
   await initGlobalFFI();
   // await Firebase.initializeApp();
-  if (isMobile) {
-    _applyLowLatencyDefaults();
-    await _applyHomeServerDefaults();
-  }
+  if (isMobile) _applyLowLatencyDefaults();
   _registerEventHandler();
   // Update the system theme.
   updateSystemWindowTheme();
@@ -145,25 +142,6 @@ void _applyLowLatencyDefaults() {
     bind.mainSetUserDefaultOption(key: kOptionImageQuality, value: 'custom');
     bind.mainSetUserDefaultOption(key: 'custom_image_quality', value: '50');
     bind.mainSetUserDefaultOption(key: 'custom-fps', value: '60');
-  }
-  bind.mainSetLocalOption(key: doneKey, value: 'Y');
-}
-
-// Mobile fork: once, use the self-hosted ID/relay server on the home server
-// (reached over Tailscale) instead of the public one, which requires signing
-// in before connecting by ID. A server the user already entered is kept, and
-// Settings > Network can still change it.
-const _kHomeServerHost = '100.109.69.38';
-const _kHomeServerKey = 'O39KYdSsxkLKzds4aa6Dp0ls1CXZNAgi54kSYhdZ7Vw=';
-
-Future<void> _applyHomeServerDefaults() async {
-  const doneKey = 'fork-home-server-defaults';
-  if (bind.mainGetLocalOption(key: doneKey) == 'Y') return;
-  if (bind.mainGetOptionSync(key: 'custom-rendezvous-server').isEmpty) {
-    await bind.mainSetOption(
-        key: 'custom-rendezvous-server', value: _kHomeServerHost);
-    await bind.mainSetOption(key: 'relay-server', value: _kHomeServerHost);
-    await bind.mainSetOption(key: 'key', value: _kHomeServerKey);
   }
   bind.mainSetLocalOption(key: doneKey, value: 'Y');
 }
