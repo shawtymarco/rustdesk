@@ -2991,14 +2991,18 @@ pub mod ios_render {
     static RGBA_CALLBACK: AtomicUsize = AtomicUsize::new(0);
     static ENCODED_CALLBACK: AtomicUsize = AtomicUsize::new(0);
 
+    // The callbacks arrive as untyped pointers: the generated bridge header
+    // cannot spell these function-pointer aliases, and an opaque type there
+    // conflicts with the Runner's declaration. Each points to an `OnRgba` /
+    // `OnEncoded` function, or is null.
     #[no_mangle]
-    pub extern "C" fn rustdesk_ios_set_video_callback(callback: Option<OnRgba>) {
-        RGBA_CALLBACK.store(callback.map_or(0, |f| f as usize), Ordering::SeqCst);
+    pub extern "C" fn rustdesk_ios_set_video_callback(callback: *const std::ffi::c_void) {
+        RGBA_CALLBACK.store(callback as usize, Ordering::SeqCst);
     }
 
     #[no_mangle]
-    pub extern "C" fn rustdesk_ios_set_decoder_callback(callback: Option<OnEncoded>) {
-        ENCODED_CALLBACK.store(callback.map_or(0, |f| f as usize), Ordering::SeqCst);
+    pub extern "C" fn rustdesk_ios_set_decoder_callback(callback: *const std::ffi::c_void) {
+        ENCODED_CALLBACK.store(callback as usize, Ordering::SeqCst);
     }
 
     // VideoToolbox currently fills the texture.

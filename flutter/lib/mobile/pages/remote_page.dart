@@ -934,7 +934,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Widget getBodyForDesktopWithListener() {
     final ffiModel = Provider.of<FfiModel>(context);
     var paints = <Widget>[ImagePaint(ffiModel: ffiModel)];
-    if (showCursorPaint) {
+    // Touch modes act where the finger lands, like Chrome Remote Desktop, so
+    // the remote pointer only shows in trackpad mode.
+    if (showCursorPaint && !ffiModel.touchMode) {
       final cursor = bind.sessionGetToggleOptionSync(
           sessionId: sessionId, arg: 'show-remote-cursor');
       if (ffiModel.keyboard || cursor) {

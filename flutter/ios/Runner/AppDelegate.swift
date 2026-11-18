@@ -37,8 +37,9 @@ import VideoToolbox
   private func registerVideoTextureChannel() {
     guard let registrar = self.registrar(forPlugin: "RustDeskVideoTexture") else { return }
     let textures = registrar.textures()
-    rustdesk_ios_set_video_callback(rustdeskIosOnRgba)
-    rustdesk_ios_set_decoder_callback(rustdeskIosOnEncoded)
+    rustdesk_ios_set_video_callback(unsafeBitCast(rustdeskIosOnRgba, to: UnsafeRawPointer.self))
+    rustdesk_ios_set_decoder_callback(
+      unsafeBitCast(rustdeskIosOnEncoded, to: UnsafeRawPointer.self))
     let channel = FlutterMethodChannel(
       name: "rustdesk/video_texture", binaryMessenger: registrar.messenger())
     channel.setMethodCallHandler { call, result in

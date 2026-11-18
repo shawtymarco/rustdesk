@@ -99,6 +99,8 @@ class _RawTouchGestureDetectorRegionState
   int _cacheLongPressPositionTs = 0;
   double _mouseScrollIntegral = 0; // mouse scroll speed controller
   double _scale = 1;
+  // Finger count that `_scale` was measured with; see `_zoomAndPanCanvas`.
+  int _scalePointerCount = 0;
 
   // Mobile touch mode two-finger gesture state.
   bool _twoFingerScrolling = false;
@@ -496,6 +498,15 @@ class _RawTouchGestureDetectorRegionState
       _isMobileTouchMode && _touchInputMode == kTouchInputThreeFinger;
 
   void _zoomAndPanCanvas(ScaleUpdateDetails d) {
+    // Flutter restarts the scale gesture whenever a finger lands or lifts, and
+    // `d.scale` then counts from 1 again while the focal point jumps to the
+    // new fingers. Re-measure from that update instead of reading the restart
+    // as a zoom-out, which shrank the view each time a finger was lifted.
+    if (d.pointerCount != _scalePointerCount) {
+      _scalePointerCount = d.pointerCount;
+      _scale = d.scale;
+      return;
+    }
     ffi.canvasModel.updateScale(d.scale / _scale, d.focalPoint);
     _scale = d.scale;
     ffi.canvasModel.panX(d.focalPointDelta.dx);
@@ -584,6 +595,7 @@ class _RawTouchGestureDetectorRegionState
     } else {
       // mobile
       _scale = 1;
+      _scalePointerCount = 0;
       // No idea why we need to set the view style to "" here.
       // bind.sessionSetViewStyle(sessionId: sessionId, value: "");
     }
@@ -596,6 +608,7 @@ class _RawTouchGestureDetectorRegionState
   // Three-finger mode: three fingers pan and zoom the local canvas.
   void onThreeFingerScaleStart(ScaleStartDetails d) {
     _scale = 1;
+    _scalePointerCount = 0;
   }
 
   void onThreeFingerScaleUpdate(ScaleUpdateDetails d) {
