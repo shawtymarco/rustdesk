@@ -35,7 +35,9 @@ jobs:
   build-ios-ipa:
     name: build unsigned ios ipa
     needs: [generate-bridge]
-    runs-on: macos-latest
+    # macOS arm64 hosted runners repeatedly never picked the job up; the Intel
+    # pool cross-compiles the same arm64 iOS build.
+    runs-on: macos-15-intel
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
