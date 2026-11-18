@@ -37,6 +37,10 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
   GestureDragUpdateCallback? onThreeFingerVerticalDragUpdate;
   GestureDragEndCallback? onThreeFingerVerticalDragEnd;
 
+  // Raw scale details for the same three-finger gesture (pan & zoom).
+  GestureScaleStartCallback? onThreeFingerScaleStart;
+  GestureScaleUpdateCallback? onThreeFingerScaleUpdate;
+
   var _currentState = GestureState.none;
   Timer? _debounceTimer;
 
@@ -57,6 +61,8 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
           onThreeFingerVerticalDragStart!(
               DragStartDetails(globalPosition: d.localFocalPoint));
         }
+        onThreeFingerScaleStart?.call(ScaleStartDetails(
+            localFocalPoint: d.localFocalPoint, focalPoint: d.focalPoint));
         debugPrint("start threeFingerScale");
       }
       if (_currentState != GestureState.none) {
@@ -75,6 +81,7 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
             if (onThreeFingerVerticalDragUpdate != null) {
               onThreeFingerVerticalDragUpdate!(_getDragUpdateDetails(d));
             }
+            onThreeFingerScaleUpdate?.call(d);
             break;
           default:
             break;

@@ -76,21 +76,15 @@ class RawTouchGestureDetectorRegion extends StatefulWidget {
       _RawTouchGestureDetectorRegionState();
 }
 
-/// How a mobile touch-mode two-finger gesture is interpreted. The first
-/// clear movement decides: fingers moving together scroll the remote side,
-/// fingers spreading or pinching zoom the local canvas.
-enum _TwoFingerMode { undecided, scroll, zoom }
-
 // Logical pixels of two-finger travel per remote wheel step.
 const double _kTouchScrollStepPx = 20;
 // Focal-point travel that commits a two-finger gesture to scrolling.
 const double _kTouchScrollSlopPx = 10;
-// Scale change that commits a two-finger gesture to zooming.
-const double _kTouchZoomSlop = 0.12;
 
 /// touchMode only:
 ///   LongPress -> right click
-///   TwoFingerPan -> scroll (mobile), TwoFingerPinch -> zoom canvas (mobile)
+///   TwoFinger -> local pan/zoom (two-finger mode) or remote scroll (direct, three-finger mode)
+///   ThreeFinger -> local pan/zoom (three-finger mode)
 ///   OneFingerPan -> start/end -> left down start/end
 ///   onDoubleTapDown -> move to
 ///   onLongPressDown => move to
@@ -107,7 +101,7 @@ class _RawTouchGestureDetectorRegionState
   double _scale = 1;
 
   // Mobile touch mode two-finger gesture state.
-  _TwoFingerMode _twoFingerMode = _TwoFingerMode.undecided;
+  bool _twoFingerScrolling = false;
   Offset _twoFingerStartFocal = Offset.zero;
   Offset _twoFingerScrollRemainder = Offset.zero;
 
@@ -474,12 +468,17 @@ class _RawTouchGestureDetectorRegionState
       // Initialize the last focal point to calculate deltas manually.
       _lastSpecialHoldDragFocalPoint = d.focalPoint;
     }
-    _twoFingerMode = _TwoFingerMode.undecided;
+    _twoFingerScrolling = false;
     _twoFingerStartFocal = d.localFocalPoint;
     _twoFingerScrollRemainder = Offset.zero;
   }
 
   bool get _isMobileTouchMode => isMobile && ffiModel.touchMode;
+  String get _touchInputMode => ffiModel.touchInputMode;
+  // Three-finger mode moves the local canvas with three fingers, so two
+  // fingers belong to the remote side.
+  bool get _localThreeFingerCanvas =>
+      _isMobileTouchMode && _touchInputMode == kTouchInputThreeFinger;
 
   void _zoomAndPanCanvas(ScaleUpdateDetails d) {
     ffi.canvasModel.updateScale(d.scale / _scale, d.focalPoint);
@@ -488,28 +487,23 @@ class _RawTouchGestureDetectorRegionState
     ffi.canvasModel.panY(d.focalPointDelta.dy);
   }
 
-  // Mobile touch mode: two fingers moving together scroll the remote content
-  // under them (natural direction), a pinch zooms the canvas.
+  // Mobile touch modes, after Chrome Remote Desktop.
   Future<void> _touchModeTwoFingerUpdate(ScaleUpdateDetails d) async {
-    if (_twoFingerMode == _TwoFingerMode.undecided) {
-      if (!canvasLocked && (d.scale - 1).abs() > _kTouchZoomSlop) {
-        _twoFingerMode = _TwoFingerMode.zoom;
-        // Start zooming from here so the decision slop does not jump the canvas.
-        _scale = d.scale;
-      } else if ((d.localFocalPoint - _twoFingerStartFocal).distance >
+    // Two-finger pan & zoom mode: two fingers only move the local canvas.
+    if (_touchInputMode == kTouchInputTwoFinger) {
+      if (!canvasLocked) _zoomAndPanCanvas(d);
+      return;
+    }
+    // Direct and three-finger modes: two fingers scroll the remote side.
+    if (!_twoFingerScrolling) {
+      if ((d.localFocalPoint - _twoFingerStartFocal).distance <=
           _kTouchScrollSlopPx) {
-        _twoFingerMode = _TwoFingerMode.scroll;
-        // Wheel events go to the element under the remote cursor.
-        await ffi.cursorModel
-            .move(_twoFingerStartFocal.dx, _twoFingerStartFocal.dy);
-      } else {
         return;
       }
-    }
-
-    if (_twoFingerMode == _TwoFingerMode.zoom) {
-      _zoomAndPanCanvas(d);
-      return;
+      _twoFingerScrolling = true;
+      // Wheel events go to the element under the remote cursor.
+      await ffi.cursorModel
+          .move(_twoFingerStartFocal.dx, _twoFingerStartFocal.dy);
     }
 
     final travel = _twoFingerScrollRemainder + d.focalPointDelta;
@@ -584,7 +578,18 @@ class _RawTouchGestureDetectorRegionState
   }
 
   get onHoldDragCancel => null;
-  get onThreeFingerVerticalDragUpdate => ffi.ffiModel.isPeerAndroid
+  // Three-finger mode: three fingers pan and zoom the local canvas.
+  void onThreeFingerScaleStart(ScaleStartDetails d) {
+    _scale = 1;
+  }
+
+  void onThreeFingerScaleUpdate(ScaleUpdateDetails d) {
+    if (!_localThreeFingerCanvas || canvasLocked) return;
+    _zoomAndPanCanvas(d);
+  }
+
+  get onThreeFingerVerticalDragUpdate =>
+      ffi.ffiModel.isPeerAndroid || _localThreeFingerCanvas
       ? null
       : (d) {
           _mouseScrollIntegral += d.delta.dy / 4;
@@ -664,7 +669,9 @@ class _RawTouchGestureDetectorRegionState
           ..onTwoFingerScaleStart = onTwoFingerScaleStart
           ..onTwoFingerScaleUpdate = onTwoFingerScaleUpdate
           ..onTwoFingerScaleEnd = onTwoFingerScaleEnd
-          ..onThreeFingerVerticalDragUpdate = onThreeFingerVerticalDragUpdate;
+          ..onThreeFingerVerticalDragUpdate = onThreeFingerVerticalDragUpdate
+          ..onThreeFingerScaleStart = onThreeFingerScaleStart
+          ..onThreeFingerScaleUpdate = onThreeFingerScaleUpdate;
       }),
     };
   }

@@ -3,7 +3,7 @@ import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/models/input_model.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:get/get.dart';
-import 'package:toggle_switch/toggle_switch.dart';
+import 'package:flutter_hbb/consts.dart';
 
 class GestureIcons {
   static const String _family = 'gestureicons';
@@ -34,35 +34,81 @@ class GestureIcons {
       IconData(0xe687, fontFamily: _family);
 }
 
-typedef OnTouchModeChange = void Function(bool);
+typedef OnTouchModeChange = void Function(String);
 
 class GestureHelp extends StatefulWidget {
   GestureHelp(
       {Key? key,
       required this.touchMode,
+      required this.touchInputMode,
       required this.onTouchModeChange,
       required this.virtualMouseMode,
       this.inputModel})
       : super(key: key);
   final bool touchMode;
+  final String touchInputMode;
   final OnTouchModeChange onTouchModeChange;
   final VirtualMouseMode virtualMouseMode;
   final InputModel? inputModel;
 
   @override
   State<StatefulWidget> createState() =>
-      _GestureHelpState(touchMode, virtualMouseMode);
+      _GestureHelpState(touchInputMode, virtualMouseMode);
 }
 
 class _GestureHelpState extends State<GestureHelp> {
-  late int _selectedIndex;
-  late bool _touchMode;
+  late String _mode;
+  bool get _touchMode => _mode != kTouchInputTrackpad;
   final VirtualMouseMode _virtualMouseMode;
 
-  _GestureHelpState(bool touchMode, VirtualMouseMode virtualMouseMode)
+  _GestureHelpState(String mode, VirtualMouseMode virtualMouseMode)
       : _virtualMouseMode = virtualMouseMode {
-    _touchMode = touchMode;
-    _selectedIndex = _touchMode ? 1 : 0;
+    _mode = mode;
+  }
+
+  static const _modes = [
+    (kTouchInputTrackpad, 'Trackpad mode',
+        'Use your touchscreen like a trackpad for precise control of the remote mouse pointer.'),
+    (kTouchInputDirect, 'Direct touch mode',
+        'All touch inputs are handled by the remote device. The desktop stays zoomed out to fit the screen.'),
+    (kTouchInputTwoFinger, 'Touch mode with two-finger pan & zoom',
+        'Move and zoom the desktop with two fingers. The remote device handles one-finger touches.'),
+    (kTouchInputThreeFinger, 'Touch mode with three-finger pan & zoom',
+        'Move and zoom the desktop with three fingers. The remote device handles one- and two-finger touches (two fingers scroll).'),
+  ];
+
+  Widget _buildModeSelector() {
+    final desc = _modes.firstWhere((m) => m.$1 == _mode, orElse: () => _modes[0]).$3;
+    return SizedBox(
+      width: 340,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final m in _modes)
+            RadioListTile<String>(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              value: m.$1,
+              groupValue: _mode,
+              title: Text(translate(m.$2)),
+              onChanged: (v) {
+                if (v == null || v == _mode) return;
+                setState(() => _mode = v);
+                widget.onTouchModeChange(v);
+                // Exit relative mouse mode when switching to a touch mode
+                _exitRelativeMouseModeIf(_touchMode);
+              },
+            ),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(translate(desc),
+                style: TextStyle(
+                    fontSize: 13, color: Theme.of(context).hintColor)),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Helper to exit relative mouse mode when certain conditions are met.
@@ -94,33 +140,7 @@ class _GestureHelpState extends State<GestureHelp> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      ToggleSwitch(
-                        initialLabelIndex: _selectedIndex,
-                        activeFgColor: Colors.white,
-                        inactiveFgColor: Colors.white60,
-                        activeBgColor: [MyTheme.accent],
-                        inactiveBgColor: Theme.of(context).hintColor,
-                        totalSwitches: 2,
-                        minWidth: 150,
-                        fontSize: 15,
-                        iconSize: 18,
-                        labels: [
-                          translate("Mouse mode"),
-                          translate("Touch mode")
-                        ],
-                        icons: [Icons.mouse, Icons.touch_app],
-                        onToggle: (index) {
-                          setState(() {
-                            if (_selectedIndex != index) {
-                              _selectedIndex = index ?? 0;
-                              _touchMode = index == 0 ? false : true;
-                              widget.onTouchModeChange(_touchMode);
-                              // Exit relative mouse mode when switching to touch mode
-                              _exitRelativeMouseModeIf(_touchMode);
-                            }
-                          });
-                        },
-                      ),
+                      _buildModeSelector(),
                       Transform.translate(
                         offset: const Offset(-10.0, 0.0),
                         child: Row(
@@ -296,21 +316,35 @@ class _GestureHelpState extends State<GestureHelp> {
                               GestureIcons.iconGestureFSwipeRight,
                               translate("One-Finger Move"),
                               translate("Mouse Drag")),
-                          GestureInfo(
-                              width,
-                              GestureIcons.iconGestureFThreeFingers,
-                              translate("Three-Finger vertically"),
-                              translate("Mouse Wheel")),
-                          GestureInfo(
-                              width,
-                              GestureIcons.iconGestureFDrag,
-                              translate("Two-Finger Move"),
-                              translate("Canvas Move")),
-                          GestureInfo(
-                              width,
-                              GestureIcons.iconGesturePinch,
-                              translate("Pinch to Zoom"),
-                              translate("Canvas Zoom")),
+                          if (_mode == kTouchInputTwoFinger) ...[
+                            GestureInfo(
+                                width,
+                                GestureIcons.iconGestureFThreeFingers,
+                                translate("Three-Finger vertically"),
+                                translate("Mouse Wheel")),
+                            GestureInfo(
+                                width,
+                                GestureIcons.iconGestureFDrag,
+                                translate("Two-Finger Move"),
+                                translate("Canvas Move")),
+                            GestureInfo(
+                                width,
+                                GestureIcons.iconGesturePinch,
+                                translate("Pinch to Zoom"),
+                                translate("Canvas Zoom")),
+                          ] else ...[
+                            GestureInfo(
+                                width,
+                                GestureIcons.iconGestureFDrag,
+                                translate("Two-Finger Move"),
+                                translate("Mouse Wheel")),
+                            if (_mode == kTouchInputThreeFinger)
+                              GestureInfo(
+                                  width,
+                                  GestureIcons.iconGestureFThreeFingers,
+                                  translate("Three-Finger Move / Pinch"),
+                                  translate("Canvas Move / Zoom")),
+                          ],
                         ]
                       : [
                           GestureInfo(

@@ -150,6 +150,13 @@ const String kOptionDisableClipboard = "disable_clipboard";
 const String kOptionLockAfterSessionEnd = "lock_after_session_end";
 const String kOptionPrivacyMode = "privacy_mode";
 const String kOptionTouchMode = "touch-mode";
+// Mobile touch input mode, modelled on Chrome Remote Desktop.
+// Values: kTouchInputTrackpad, kTouchInputDirect, kTouchInputTwoFinger, kTouchInputThreeFinger.
+const String kOptionTouchInputMode = "touch-input-mode";
+const String kTouchInputTrackpad = "trackpad";
+const String kTouchInputDirect = "direct";
+const String kTouchInputTwoFinger = "two-finger";
+const String kTouchInputThreeFinger = "three-finger";
 const String kOptionI444 = "i444";
 const String kOptionSwapLeftRightMouse = "swap-left-right-mouse";
 const String kOptionCodecPreference = "codec-preference";

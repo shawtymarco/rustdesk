@@ -527,6 +527,19 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _mobileFocusNode.requestFocus();
   }
 
+  // Backspace button: edit the local line while it has text, otherwise
+  // delete on the remote side.
+  void _composeBackspace() {
+    final text = _composeText;
+    if (text.isEmpty) {
+      if (inputModel.keyboardInputAllowed) inputModel.inputKey('VK_BACK');
+    } else {
+      final chars = text.characters;
+      _resetCompose(chars.take(chars.length - 1).toString());
+    }
+    _mobileFocusNode.requestFocus();
+  }
+
   void _closeSoftKeyboard() {
     setState(() {
       _showEdit = false;
@@ -537,8 +550,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   // Visible input line above the soft keyboard: text and Hangul composition
-  // stay local until sent. The send button types the text; the keyboard's
-  // return key types the text and then Enter (Enter alone when empty).
+  // stay local until sent. The keyboard action key types the text; the
+  // return button types it and then Enter (Enter alone when empty).
   Widget _buildComposeBar() {
     final theme = Theme.of(context);
     return Material(
@@ -563,22 +576,31 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 keyboardType: TextInputType.text,
                 textInputAction: TextInputAction.send,
                 maxLines: 1,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
+                  hintText: translate('Send text'),
                   isDense: true,
                   border: UnderlineInputBorder(),
                   contentPadding:
                       EdgeInsets.symmetric(horizontal: 8, vertical: 10),
                 ),
                 onChanged: _handleComposeChanged,
-                onSubmitted: (_) => _submitCompose(pressEnter: true),
-                // Keep the keyboard open after the return key.
+                // The keyboard action key sends the text; the return button
+                // next to the field also presses Enter (as in Chrome Remote
+                // Desktop).
+                onSubmitted: (_) => _submitCompose(pressEnter: false),
+                // Keep the keyboard open after the action key.
                 onEditingComplete: () {},
               ),
             ),
             IconButton(
-              icon: Icon(Icons.send, color: MyTheme.accent),
-              tooltip: translate('Send'),
-              onPressed: () => _submitCompose(pressEnter: false),
+              icon: const Icon(Icons.backspace_outlined),
+              tooltip: translate('Backspace'),
+              onPressed: _composeBackspace,
+            ),
+            IconButton(
+              icon: Icon(Icons.keyboard_return, color: MyTheme.accent),
+              tooltip: translate('Enter'),
+              onPressed: () => _submitCompose(pressEnter: true),
             ),
           ],
         ),
@@ -1064,10 +1086,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             padding: EdgeInsets.symmetric(vertical: 10),
             child: GestureHelp(
               touchMode: gFFI.ffiModel.touchMode,
-              onTouchModeChange: (t) {
-                gFFI.ffiModel.toggleTouchMode();
-                final v = gFFI.ffiModel.touchMode ? 'Y' : 'N';
-                bind.mainSetLocalOption(key: kOptionTouchMode, value: v);
+              touchInputMode: gFFI.ffiModel.touchInputMode,
+              onTouchModeChange: (mode) {
+                gFFI.ffiModel.setTouchInputMode(mode);
+                // Direct touch keeps the whole desktop in view.
+                if (mode == kTouchInputDirect) gFFI.canvasModel.reset();
               },
               virtualMouseMode: gFFI.ffiModel.virtualMouseMode,
               inputModel: gFFI.inputModel,

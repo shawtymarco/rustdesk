@@ -117,6 +117,7 @@ class FfiModel with ChangeNotifier {
   bool? _secure;
   bool? _direct;
   bool _touchMode = false;
+  String _touchInputMode = kTouchInputTrackpad;
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
   Timer? _restartReconnectDelayTimer;
@@ -159,6 +160,20 @@ class FfiModel with ChangeNotifier {
   bool get inputBlocked => _inputBlocked;
 
   bool get touchMode => _touchMode;
+
+  /// One of kTouchInputTrackpad, kTouchInputDirect, kTouchInputTwoFinger,
+  /// kTouchInputThreeFinger. Anything but trackpad is a touch mode.
+  String get touchInputMode => _touchInputMode;
+
+  void setTouchInputMode(String mode) {
+    if (isPeerAndroid) return;
+    _touchInputMode = mode;
+    _touchMode = mode != kTouchInputTrackpad;
+    bind.mainSetLocalOption(key: kOptionTouchInputMode, value: mode);
+    bind.mainSetLocalOption(
+        key: kOptionTouchMode, value: _touchMode ? 'Y' : 'N');
+    notifyListeners();
+  }
 
   bool get isPeerAndroid => _pi.platform == kPeerPlatformAndroid;
   bool get isPeerMobile => isPeerAndroid;
@@ -212,8 +227,8 @@ class FfiModel with ChangeNotifier {
 
   toggleTouchMode() {
     if (!isPeerAndroid) {
-      _touchMode = !_touchMode;
-      notifyListeners();
+      setTouchInputMode(
+          _touchMode ? kTouchInputTrackpad : kTouchInputThreeFinger);
     }
   }
 
@@ -1406,6 +1421,27 @@ class FfiModel with ChangeNotifier {
         final optSession = await bind.sessionGetOption(
             sessionId: sessionId, arg: kOptionTouchMode);
         _touchMode = optSession != '';
+      }
+      if (isMobile) {
+        // Phones and tablets default to touch input; an explicit earlier
+        // mouse/touch choice is kept.
+        final mode = bind.mainGetLocalOption(key: kOptionTouchInputMode);
+        if (const [
+          kTouchInputTrackpad,
+          kTouchInputDirect,
+          kTouchInputTwoFinger,
+          kTouchInputThreeFinger
+        ].contains(mode)) {
+          _touchInputMode = mode;
+        } else if (optLocal == 'N') {
+          _touchInputMode = kTouchInputTrackpad;
+        } else {
+          _touchInputMode = kTouchInputThreeFinger;
+        }
+        _touchMode = _touchInputMode != kTouchInputTrackpad;
+      } else {
+        _touchInputMode =
+            _touchMode ? kTouchInputTwoFinger : kTouchInputTrackpad;
       }
     }
     if (isMobile) {
