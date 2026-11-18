@@ -2446,12 +2446,31 @@ pub(super) mod async_tasks {
     }
 }
 
-/// Native video output for the Android client: frames are copied into the
-/// `Surface` of a Flutter `SurfaceTexture` through `ANativeWindow`, so the Dart
-/// side shows them with a `Texture` widget instead of decoding every frame.
+/// Native video output for the Android client. The activity creates a Flutter
+/// `SurfaceTexture` and passes its `Surface` here; Dart shows it with a
+/// `Texture` widget (VideoTexturePaint) instead of decoding every frame.
+///
+/// H264/H265 frames go to a hardware MediaCodec decoder whose output is that
+/// surface, so frames never touch the CPU after the network. Other codecs, or a
+/// device where the decoder cannot start, decode in software and the RGBA frame
+/// is copied into the surface through `ANativeWindow`.
+///
+/// Dart still needs one image per frame size for layout and cursor maths; the
+/// software path sends the real frame, the MediaCodec path a blank one.
 #[cfg(target_os = "android")]
 pub mod android_render {
-    use std::{ffi::c_void, ptr, sync::Mutex};
+    use base::message_proto::{video_frame, EncodedVideoFrames};
+    use hbb_common::{anyhow::anyhow, bail, log, ResultType};
+    use std::{
+        ffi::c_void,
+        os::raw::c_char,
+        ptr,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        thread::JoinHandle,
+    };
 
     #[repr(C)]
     struct ANativeWindowBuffer {
@@ -2481,21 +2500,83 @@ pub mod android_render {
         fn ANativeWindow_unlockAndPost(window: *mut c_void) -> i32;
     }
 
+    #[repr(C)]
+    struct AMediaCodecBufferInfo {
+        offset: i32,
+        size: i32,
+        presentation_time_us: i64,
+        flags: u32,
+    }
+
+    #[link(name = "mediandk")]
+    extern "C" {
+        fn AMediaCodec_createDecoderByType(mime: *const c_char) -> *mut c_void;
+        fn AMediaCodec_configure(
+            codec: *mut c_void,
+            format: *const c_void,
+            surface: *mut c_void,
+            crypto: *mut c_void,
+            flags: u32,
+        ) -> i32;
+        fn AMediaCodec_start(codec: *mut c_void) -> i32;
+        fn AMediaCodec_stop(codec: *mut c_void) -> i32;
+        fn AMediaCodec_delete(codec: *mut c_void) -> i32;
+        fn AMediaCodec_dequeueInputBuffer(codec: *mut c_void, timeout_us: i64) -> isize;
+        fn AMediaCodec_getInputBuffer(
+            codec: *mut c_void,
+            idx: usize,
+            out_size: *mut usize,
+        ) -> *mut u8;
+        fn AMediaCodec_queueInputBuffer(
+            codec: *mut c_void,
+            idx: usize,
+            offset: i64,
+            size: usize,
+            time_us: u64,
+            flags: u32,
+        ) -> i32;
+        fn AMediaCodec_dequeueOutputBuffer(
+            codec: *mut c_void,
+            info: *mut AMediaCodecBufferInfo,
+            timeout_us: i64,
+        ) -> isize;
+        fn AMediaCodec_releaseOutputBuffer(codec: *mut c_void, idx: usize, render: bool) -> i32;
+        fn AMediaCodec_getOutputFormat(codec: *mut c_void) -> *mut c_void;
+        fn AMediaFormat_new() -> *mut c_void;
+        fn AMediaFormat_delete(format: *mut c_void) -> i32;
+        fn AMediaFormat_setString(format: *mut c_void, name: *const c_char, value: *const c_char);
+        fn AMediaFormat_setInt32(format: *mut c_void, name: *const c_char, value: i32);
+        fn AMediaFormat_getInt32(format: *mut c_void, name: *const c_char, out: *mut i32) -> bool;
+    }
+
     // Byte order R, G, B, A: the client decodes to `ImageFormat::ABGR` on Android.
     const WINDOW_FORMAT_RGBA_8888: i32 = 1;
+    const INFO_OUTPUT_FORMAT_CHANGED: isize = -2;
+
+    fn cstr(s: &'static [u8]) -> *const c_char {
+        debug_assert!(s.ends_with(b"\0"));
+        s.as_ptr() as _
+    }
 
     struct Window {
         ptr: *mut c_void,
+        // Increments with every new surface, so decoders bound to an old one stop.
+        generation: u64,
         width: usize,
         height: usize,
         // Whether Dart has been sent a soft frame of the current size.
         soft_frame_sent: bool,
+        // A MediaCodec decoder renders into the surface.
+        codec_owned: bool,
+        // The CPU path has drawn; a decoder can no longer connect to the surface.
+        cpu_connected: bool,
     }
 
     // The window pointer is only used under the mutex.
     unsafe impl Send for Window {}
 
     static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+    static GENERATION: Mutex<u64> = Mutex::new(0);
 
     /// Replace the output surface; a null `surface` stops native output.
     pub unsafe fn set_surface(env: *mut c_void, surface: *mut c_void) {
@@ -2508,20 +2589,63 @@ pub mod android_render {
         }
         let ptr = ANativeWindow_fromSurface(env, surface);
         if !ptr.is_null() {
+            let mut generation = GENERATION.lock().unwrap();
+            *generation += 1;
             *window = Some(Window {
                 ptr,
+                generation: *generation,
                 width: 0,
                 height: 0,
                 soft_frame_sent: false,
+                codec_owned: false,
+                cpu_connected: false,
             });
         }
     }
 
-    /// Draw one frame. `None`: no surface or the draw failed, use the soft path.
-    /// `Some(true)`: drawn, and Dart also needs this frame (first of its size).
+    fn current_generation() -> Option<u64> {
+        WINDOW.lock().unwrap().as_ref().map(|w| w.generation)
+    }
+
+    /// The surface for a decoder, if it is still `generation` and free.
+    fn claim_window(generation: u64) -> Option<*mut c_void> {
+        let mut guard = WINDOW.lock().unwrap();
+        let window = guard.as_mut()?;
+        if window.generation != generation || window.cpu_connected {
+            return None;
+        }
+        window.codec_owned = true;
+        window.soft_frame_sent = false;
+        Some(window.ptr)
+    }
+
+    fn release_window(generation: u64) {
+        if let Some(window) = WINDOW.lock().unwrap().as_mut() {
+            if window.generation == generation {
+                window.codec_owned = false;
+            }
+        }
+    }
+
+    // The decoder's output size changed: Dart needs a new (blank) frame.
+    fn request_soft_frame(generation: u64) {
+        if let Some(window) = WINDOW.lock().unwrap().as_mut() {
+            if window.generation == generation {
+                window.soft_frame_sent = false;
+            }
+        }
+    }
+
+    /// Show one software-decoded frame. `None`: no surface or the draw failed,
+    /// use the soft path. `Some(true)`: Dart also needs this frame.
     pub fn draw(rgba: &scrap::ImageRgb) -> Option<bool> {
         let mut guard = WINDOW.lock().unwrap();
         let window = guard.as_mut()?;
+        if window.codec_owned {
+            // The decoder already put the picture on screen; `rgba` is the
+            // blank layout frame and only goes to Dart when one is due.
+            return Some(!std::mem::replace(&mut window.soft_frame_sent, true));
+        }
         let (w, h) = (rgba.w, rgba.h);
         if w == 0 || h == 0 {
             return None;
@@ -2549,6 +2673,7 @@ pub mod android_render {
             if ANativeWindow_lock(window.ptr, &mut buffer, ptr::null_mut()) != 0 {
                 return None;
             }
+            window.cpu_connected = true;
             let dst = buffer.bits as *mut u8;
             let dst_stride = buffer.stride.max(0) as usize * 4;
             let rows = h.min(buffer.height.max(0) as usize);
@@ -2569,38 +2694,331 @@ pub mod android_render {
         window.soft_frame_sent = true;
         Some(need_soft)
     }
+
+    struct Codec(*mut c_void);
+    // AMediaCodec allows input and output calls from different threads.
+    unsafe impl Send for Codec {}
+    unsafe impl Sync for Codec {}
+
+    /// Hardware decoder rendering straight into the texture surface. A second
+    /// thread waits on output buffers and shows each one as soon as it is ready.
+    struct SurfaceDecoder {
+        codec: Arc<Codec>,
+        generation: u64,
+        h265: bool,
+        stop: Arc<AtomicBool>,
+        output: Option<JoinHandle<()>>,
+        new_size: Arc<Mutex<Option<(usize, usize)>>>,
+        waiting_key: bool,
+        refresh_requested: bool,
+        pts: u64,
+    }
+
+    impl SurfaceDecoder {
+        fn new(h265: bool, generation: u64) -> Option<Self> {
+            let window = claim_window(generation)?;
+            let mime = if h265 {
+                cstr(b"video/hevc\0")
+            } else {
+                cstr(b"video/avc\0")
+            };
+            unsafe {
+                let codec = AMediaCodec_createDecoderByType(mime);
+                if codec.is_null() {
+                    log::warn!("no MediaCodec decoder for h265={h265}");
+                    release_window(generation);
+                    return None;
+                }
+                let format = AMediaFormat_new();
+                AMediaFormat_setString(format, cstr(b"mime\0"), mime);
+                // The real size comes from the stream; these only size buffers.
+                AMediaFormat_setInt32(format, cstr(b"width\0"), 1920);
+                AMediaFormat_setInt32(format, cstr(b"height\0"), 1080);
+                AMediaFormat_setInt32(format, cstr(b"max-input-size\0"), 8 << 20);
+                // Ask for no frame reordering delay and realtime priority.
+                AMediaFormat_setInt32(format, cstr(b"low-latency\0"), 1);
+                AMediaFormat_setInt32(
+                    format,
+                    cstr(b"vendor.qti-ext-dec-low-latency.enable\0"),
+                    1,
+                );
+                AMediaFormat_setInt32(format, cstr(b"priority\0"), 0);
+                let status = AMediaCodec_configure(codec, format, window, ptr::null_mut(), 0);
+                AMediaFormat_delete(format);
+                if status != 0 || AMediaCodec_start(codec) != 0 {
+                    log::warn!("MediaCodec surface decoder failed to start: {status}");
+                    AMediaCodec_delete(codec);
+                    release_window(generation);
+                    return None;
+                }
+                log::info!("MediaCodec surface decoder started, h265={h265}");
+                let codec = Arc::new(Codec(codec));
+                let stop = Arc::new(AtomicBool::new(false));
+                let new_size = Arc::new(Mutex::new(None));
+                let output = {
+                    let (codec, stop, new_size) = (codec.clone(), stop.clone(), new_size.clone());
+                    std::thread::Builder::new()
+                        .name("surface-decoder-output".to_owned())
+                        .spawn(move || output_loop(codec, stop, new_size))
+                        .ok()
+                };
+                Some(Self {
+                    codec,
+                    generation,
+                    h265,
+                    stop,
+                    output,
+                    new_size,
+                    waiting_key: true,
+                    refresh_requested: false,
+                    pts: 0,
+                })
+            }
+        }
+
+        /// Ok(false): still waiting for a key frame.
+        fn decode(&mut self, frames: &EncodedVideoFrames) -> ResultType<bool> {
+            let codec = self.codec.0;
+            for frame in frames.frames.iter() {
+                if self.waiting_key {
+                    if !frame.key {
+                        continue;
+                    }
+                    self.waiting_key = false;
+                }
+                let data = &frame.data;
+                unsafe {
+                    let idx = AMediaCodec_dequeueInputBuffer(codec, 50_000);
+                    if idx < 0 {
+                        bail!("no MediaCodec input buffer: {idx}");
+                    }
+                    let mut capacity = 0usize;
+                    let buf = AMediaCodec_getInputBuffer(codec, idx as usize, &mut capacity);
+                    if buf.is_null() || data.len() > capacity {
+                        bail!("MediaCodec input buffer too small: {}", data.len());
+                    }
+                    ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
+                    let status = AMediaCodec_queueInputBuffer(
+                        codec,
+                        idx as usize,
+                        0,
+                        data.len(),
+                        self.pts,
+                        0,
+                    );
+                    if status != 0 {
+                        bail!("MediaCodec queueInputBuffer failed: {status}");
+                    }
+                    self.pts += 16_666;
+                }
+            }
+            Ok(!self.waiting_key)
+        }
+    }
+
+    impl Drop for SurfaceDecoder {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(output) = self.output.take() {
+                output.join().ok();
+            }
+            unsafe {
+                AMediaCodec_stop(self.codec.0);
+                AMediaCodec_delete(self.codec.0);
+            }
+            release_window(self.generation);
+        }
+    }
+
+    fn output_loop(
+        codec: Arc<Codec>,
+        stop: Arc<AtomicBool>,
+        new_size: Arc<Mutex<Option<(usize, usize)>>>,
+    ) {
+        let codec = codec.0;
+        while !stop.load(Ordering::SeqCst) {
+            let mut info: AMediaCodecBufferInfo = unsafe { std::mem::zeroed() };
+            let idx = unsafe { AMediaCodec_dequeueOutputBuffer(codec, &mut info, 20_000) };
+            if idx >= 0 {
+                unsafe { AMediaCodec_releaseOutputBuffer(codec, idx as usize, true) };
+            } else if idx == INFO_OUTPUT_FORMAT_CHANGED {
+                if let Some(size) = unsafe { output_size(codec) } {
+                    *new_size.lock().unwrap() = Some(size);
+                }
+            }
+        }
+    }
+
+    unsafe fn output_size(codec: *mut c_void) -> Option<(usize, usize)> {
+        let format = AMediaCodec_getOutputFormat(codec);
+        if format.is_null() {
+            return None;
+        }
+        let get = |name: &'static [u8]| -> Option<i32> {
+            let mut v = 0i32;
+            if AMediaFormat_getInt32(format, cstr(name), &mut v) {
+                Some(v)
+            } else {
+                None
+            }
+        };
+        let width = get(b"width\0");
+        let height = get(b"height\0");
+        let crop = (
+            get(b"crop-left\0"),
+            get(b"crop-top\0"),
+            get(b"crop-right\0"),
+            get(b"crop-bottom\0"),
+        );
+        AMediaFormat_delete(format);
+        let (w, h) = match crop {
+            (Some(l), Some(t), Some(r), Some(b)) => (r - l + 1, b - t + 1),
+            _ => (width?, height?),
+        };
+        if w > 0 && h > 0 {
+            Some((w as usize, h as usize))
+        } else {
+            None
+        }
+    }
+
+    /// Per-display state kept by the client's `VideoHandler`.
+    #[derive(Default)]
+    pub struct NativeVideo {
+        decoder: Option<SurfaceDecoder>,
+        // The surface generation where the decoder failed; use software there.
+        failed_generation: Option<u64>,
+    }
+
+    impl NativeVideo {
+        /// `Some(result)` when the frame was handled by the hardware decoder.
+        /// `Ok(true)` lets the caller run its frame callback, which hands
+        /// `rgb` (a blank frame of the new size, when one is due) to Dart.
+        pub fn handle(
+            &mut self,
+            frame: &video_frame::Union,
+            rgb: &mut scrap::ImageRgb,
+        ) -> Option<ResultType<bool>> {
+            let (frames, h265) = match frame {
+                video_frame::Union::H264s(f) => (f, false),
+                video_frame::Union::H265s(f) => (f, true),
+                _ => {
+                    self.decoder = None;
+                    return None;
+                }
+            };
+            let Some(generation) = current_generation() else {
+                self.decoder = None;
+                return None;
+            };
+            if self.failed_generation == Some(generation) {
+                return None;
+            }
+            if self
+                .decoder
+                .as_ref()
+                .map_or(false, |d| d.generation != generation || d.h265 != h265)
+            {
+                self.decoder = None;
+            }
+            if self.decoder.is_none() {
+                match SurfaceDecoder::new(h265, generation) {
+                    Some(d) => self.decoder = Some(d),
+                    None => {
+                        self.failed_generation = Some(generation);
+                        return None;
+                    }
+                }
+            }
+            let decoder = self.decoder.as_mut()?;
+            match decoder.decode(frames) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Joined mid-stream: ask the peer for a key frame once.
+                    if decoder.refresh_requested {
+                        return Some(Ok(false));
+                    }
+                    decoder.refresh_requested = true;
+                    return Some(Err(anyhow!("surface decoder waiting for a key frame")));
+                }
+                Err(e) => {
+                    log::error!("MediaCodec surface decoder failed, using software: {e}");
+                    self.decoder = None;
+                    self.failed_generation = Some(generation);
+                    // The caller refreshes the video, so software starts at a key frame.
+                    return Some(Err(e));
+                }
+            }
+            let new_size = decoder.new_size.lock().unwrap().take();
+            if let Some((w, h)) = new_size {
+                rgb.w = w;
+                rgb.h = h;
+                rgb.raw.clear();
+                // Rows are packed on mobile (align 1).
+                rgb.raw.resize(w * 4 * h, 0);
+                request_soft_frame(generation);
+            }
+            Some(Ok(true))
+        }
+    }
 }
 
-/// Native video output for the iOS client; see `RustDeskVideoTexture` in
-/// flutter/ios/Runner/AppDelegate.swift.
+/// Native video output for the iOS client; see `RustDeskVideoTexture` and
+/// `RustDeskHwDecoder` in flutter/ios/Runner/AppDelegate.swift.
+///
+/// H264/H265 frames go to VideoToolbox in the Runner, which decodes straight
+/// into the CVPixelBuffer the Flutter texture shows. Other codecs decode in
+/// software and the BGRA frame is copied into the texture. Dart gets one image
+/// per frame size for layout: the real frame, or a blank one on the hardware path.
 #[cfg(target_os = "ios")]
 pub mod ios_render {
+    use base::message_proto::video_frame;
+    use hbb_common::{anyhow::anyhow, ResultType};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     };
 
     // 0: not drawn, 1: drawn, 2: drawn and first frame of the texture.
     type OnRgba = unsafe extern "C" fn(*const u8, usize, i32, i32) -> i32;
+    // 0: not handled (no texture or no decoder), 1: handled,
+    // 2: handled but the decoder needs a key frame first.
+    // Writes the decoded picture size (0 while unknown) to the out pointers.
+    type OnEncoded = unsafe extern "C" fn(*const u8, usize, i32, i32, *mut i32, *mut i32) -> i32;
 
-    // Set by the Runner at start-up. A callback instead of a linked symbol,
+    // Set by the Runner at start-up. Callbacks instead of linked symbols,
     // because the crate is also built as a cdylib without the Runner.
-    static CALLBACK: AtomicUsize = AtomicUsize::new(0);
+    static RGBA_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+    static ENCODED_CALLBACK: AtomicUsize = AtomicUsize::new(0);
 
     #[no_mangle]
     pub extern "C" fn rustdesk_ios_set_video_callback(callback: Option<OnRgba>) {
-        CALLBACK.store(callback.map_or(0, |f| f as usize), Ordering::SeqCst);
+        RGBA_CALLBACK.store(callback.map_or(0, |f| f as usize), Ordering::SeqCst);
     }
 
+    #[no_mangle]
+    pub extern "C" fn rustdesk_ios_set_decoder_callback(callback: Option<OnEncoded>) {
+        ENCODED_CALLBACK.store(callback.map_or(0, |f| f as usize), Ordering::SeqCst);
+    }
+
+    // VideoToolbox currently fills the texture.
+    static HW_ACTIVE: AtomicBool = AtomicBool::new(false);
+    // Dart has the blank layout frame of the current hardware picture size.
+    static HW_SOFT_FRAME_SENT: AtomicBool = AtomicBool::new(false);
     static LAST_SIZE: Mutex<(usize, usize)> = Mutex::new((0, 0));
 
-    /// `None`: not drawn, use the soft path. `Some(true)`: drawn, and Dart
-    /// also needs this frame (first of its size or of the texture).
+    /// Show one software-decoded frame. `None`: not drawn, use the soft path.
+    /// `Some(true)`: Dart also needs this frame (first of its size or texture).
     pub fn draw(rgba: &scrap::ImageRgb) -> Option<bool> {
+        if HW_ACTIVE.load(Ordering::SeqCst) {
+            // VideoToolbox already put the picture on screen; `rgba` is the
+            // blank layout frame and only goes to Dart when one is due.
+            return Some(!HW_SOFT_FRAME_SENT.swap(true, Ordering::SeqCst));
+        }
         if rgba.w == 0 || rgba.h == 0 {
             return None;
         }
-        let callback = CALLBACK.load(Ordering::SeqCst);
+        let callback = RGBA_CALLBACK.load(Ordering::SeqCst);
         if callback == 0 {
             return None;
         }
@@ -2615,5 +3033,78 @@ pub mod ios_render {
         let changed = *last != (rgba.w, rgba.h);
         *last = (rgba.w, rgba.h);
         Some(res == 2 || changed)
+    }
+
+    /// Per-display state kept by the client's `VideoHandler`.
+    #[derive(Default)]
+    pub struct NativeVideo {
+        size: (usize, usize),
+        refresh_requested: bool,
+    }
+
+    impl NativeVideo {
+        /// `Some(result)` when VideoToolbox handled the frame. `Ok(true)` lets
+        /// the caller run its frame callback, which hands `rgb` (a blank frame
+        /// of the new size, when one is due) to Dart.
+        pub fn handle(
+            &mut self,
+            frame: &video_frame::Union,
+            rgb: &mut scrap::ImageRgb,
+        ) -> Option<ResultType<bool>> {
+            let (frames, h265) = match frame {
+                video_frame::Union::H264s(f) => (f, false),
+                video_frame::Union::H265s(f) => (f, true),
+                _ => {
+                    HW_ACTIVE.store(false, Ordering::SeqCst);
+                    return None;
+                }
+            };
+            let callback = ENCODED_CALLBACK.load(Ordering::SeqCst);
+            if callback == 0 {
+                HW_ACTIVE.store(false, Ordering::SeqCst);
+                return None;
+            }
+            let f: OnEncoded = unsafe { std::mem::transmute(callback) };
+            let mut need_key = false;
+            for frame in frames.frames.iter() {
+                let (mut w, mut h) = (0i32, 0i32);
+                let res = unsafe {
+                    f(
+                        frame.data.as_ptr(),
+                        frame.data.len(),
+                        h265 as i32,
+                        frame.key as i32,
+                        &mut w,
+                        &mut h,
+                    )
+                };
+                if res == 0 {
+                    HW_ACTIVE.store(false, Ordering::SeqCst);
+                    return None;
+                }
+                need_key |= res == 2;
+                if w > 0 && h > 0 && self.size != (w as usize, h as usize) {
+                    let (w, h) = (w as usize, h as usize);
+                    self.size = (w, h);
+                    rgb.w = w;
+                    rgb.h = h;
+                    rgb.raw.clear();
+                    // Rows are packed on mobile (align 1).
+                    rgb.raw.resize(w * 4 * h, 0);
+                    HW_SOFT_FRAME_SENT.store(false, Ordering::SeqCst);
+                }
+            }
+            HW_ACTIVE.store(true, Ordering::SeqCst);
+            if need_key {
+                // Joined mid-stream: ask the peer for a key frame once.
+                if self.refresh_requested {
+                    return Some(Ok(false));
+                }
+                self.refresh_requested = true;
+                return Some(Err(anyhow!("VideoToolbox decoder waiting for a key frame")));
+            }
+            self.refresh_requested = false;
+            Some(Ok(true))
+        }
     }
 }

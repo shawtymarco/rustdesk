@@ -2649,6 +2649,11 @@ pub struct VideoHandler {
     _display: usize, // useful for debug
     fail_counter: usize,
     first_frame: bool,
+    // Hardware decoding straight into the mobile video texture.
+    #[cfg(all(feature = "flutter", target_os = "android"))]
+    native: crate::flutter::android_render::NativeVideo,
+    #[cfg(all(feature = "flutter", target_os = "ios"))]
+    native: crate::flutter::ios_render::NativeVideo,
 }
 
 impl VideoHandler {
@@ -2683,6 +2688,8 @@ impl VideoHandler {
             _display,
             fail_counter: 0,
             first_frame: true,
+            #[cfg(all(feature = "flutter", any(target_os = "android", target_os = "ios")))]
+            native: Default::default(),
         }
     }
 
@@ -2697,6 +2704,19 @@ impl VideoHandler {
         let format = CodecFormat::from(&vf);
         if format != self.decoder.format() {
             self.reset(Some(format));
+        }
+        // Mobile: H264/H265 go to the platform hardware decoder, which renders
+        // straight into the video texture; everything else falls through.
+        #[cfg(all(feature = "flutter", any(target_os = "android", target_os = "ios")))]
+        if let Some(frame) = &vf.union {
+            if let Some(res) = self.native.handle(frame, &mut self.rgb) {
+                *pixelbuffer = true;
+                if res.as_ref().is_ok_and(|x| *x) {
+                    self.fail_counter = 0;
+                    self.first_frame = false;
+                }
+                return res;
+            }
         }
         match &vf.union {
             Some(frame) => {
